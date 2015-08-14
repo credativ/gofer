@@ -15,7 +15,7 @@ from logging import getLogger
 from socket import error as SocketError
 
 from amqp import Connection as RealConnection
-from amqp import ConnectionError
+from amqp import ConnectionError, ConnectionForced, RecoverableConnectionError
 
 from gofer.common import ThreadSingleton, utf8
 from gofer.messaging.adapter.model import Connector, BaseConnection
@@ -29,6 +29,30 @@ USERID = 'guest'
 PASSWORD = 'guest'
 
 CONNECTION_EXCEPTIONS = (IOError, SocketError, ConnectionError, AttributeError)
+
+
+class HeartbeatThread(Thread):
+    """
+    Thread to send AMQP heartbeats.
+    """
+    
+    def __init__(self, connection):
+        Thread.__init__(self, name='Heartbeat')
+        self._connection = connection
+        self.setDaemon(True)
+
+    def run(self):
+        """
+        Send AMQP heartbeats.
+        """
+        while not Thread.aborted():
+            try:
+                self._connection.heartbeat_tick()
+            except RecoverableConnectionError:
+                pass
+            except ConnectionForced, e:
+                log.exception(e)
+            sleep(1)
 
 
 class Connection(BaseConnection):
@@ -70,6 +94,7 @@ class Connection(BaseConnection):
         """
         BaseConnection.__init__(self, url)
         self._impl = None
+        self._thread = None
 
     def is_open(self):
         """
@@ -100,7 +125,10 @@ class Connection(BaseConnection):
             ssl=domain,
             userid=userid,
             password=password,
+            heartbeat=10,
             confirm_publish=True)
+        self._thread = HeartbeatThread(self._impl)
+        self._thread.start()
         log.info('opened: %s', self.url)
 
     def channel(self):
@@ -116,6 +144,10 @@ class Connection(BaseConnection):
         """
         connection = self._impl
         self._impl = None
+        if self._thread:
+            self._thread.abort()
+            self._thread.join()
+
         try:
             connection.close()
             log.info('closed: %s', self.url)
